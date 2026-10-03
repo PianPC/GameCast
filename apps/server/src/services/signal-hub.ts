@@ -311,16 +311,23 @@ export class SignalHub {
       }
       case "rtc.offer":
       case "rtc.answer": {
-        try {
-          this.rooms.validateRtcRoute(
-            room.id,
-            participant.id,
-            message.targetParticipantId,
-            message.connectionId,
-          );
-        } catch (error) {
-          if (isWatchNotFound(error)) return;
-          throw error;
+        const isVoiceMessage = message.connectionId.startsWith("voice-");
+        if (!isVoiceMessage) {
+          try {
+            this.rooms.validateRtcRoute(
+              room.id,
+              participant.id,
+              message.targetParticipantId,
+              message.connectionId,
+            );
+          } catch (error) {
+            if (isWatchNotFound(error)) return;
+            throw error;
+          }
+        } else {
+          // 语音消息：只需验证双方都在房间内
+          const target = this.rooms.getParticipant(room.id, message.targetParticipantId);
+          if (!target) return;
         }
         this.sendTo(room.id, message.targetParticipantId, {
           type: message.type,
@@ -331,16 +338,23 @@ export class SignalHub {
         return;
       }
       case "rtc.ice": {
-        try {
-          this.rooms.validateRtcRoute(
-            room.id,
-            participant.id,
-            message.targetParticipantId,
-            message.connectionId,
-          );
-        } catch (error) {
-          if (isWatchNotFound(error)) return;
-          throw error;
+        const isVoiceMessage = message.connectionId.startsWith("voice-");
+        if (!isVoiceMessage) {
+          try {
+            this.rooms.validateRtcRoute(
+              room.id,
+              participant.id,
+              message.targetParticipantId,
+              message.connectionId,
+            );
+          } catch (error) {
+            if (isWatchNotFound(error)) return;
+            throw error;
+          }
+        } else {
+          // 语音消息：只需验证双方都在房间内
+          const target = this.rooms.getParticipant(room.id, message.targetParticipantId);
+          if (!target) return;
         }
         this.sendTo(room.id, message.targetParticipantId, {
           type: "rtc.ice",

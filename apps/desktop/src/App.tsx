@@ -12,6 +12,8 @@ import {
   LoaderCircle,
   LogOut,
   Maximize2,
+  Mic,
+  MicOff,
   MonitorUp,
   Network,
   Palette,
@@ -963,11 +965,17 @@ function RoomView({ session, localHost, networkStarted, networkInvite, onLeave, 
           <div className="member-list">
             {live.participants.map((participant) => {
               const isSharer = live.sharers.some((sharer) => sharer.id === participant.id);
+              const isSpeaking = live.remoteSpeakers.has(participant.id);
+              const isLocal = participant.id === session.participant.id;
+              const localSpeaking = isLocal && live.micEnabled;
               return (
                 <div className="member-row" key={participant.id}>
-                  <span className="member-dot" />
-                  <strong>{participant.displayName}</strong>
-                  <small>{participant.role === "host" ? "房主" : isSharer ? "共享中" : "在线"}</small>
+                  <span className={`member-dot ${(isSpeaking || localSpeaking) ? "speaking" : ""}`} />
+                  <strong>{participant.displayName}{isLocal && <em>你</em>}</strong>
+                  <small>
+                    {participant.role === "host" ? "房主" : isSharer ? "共享中" : "在线"}
+                    {(isSpeaking || localSpeaking) && " · 语音中"}
+                  </small>
                 </div>
               );
             })}
@@ -994,6 +1002,7 @@ function RoomView({ session, localHost, networkStarted, networkInvite, onLeave, 
           <div className="player-frame">
             <video ref={live.videoRef} autoPlay playsInline muted />
             <audio ref={live.audioRef} autoPlay />
+            <audio ref={live.bindVoiceAudio} autoPlay />
             {!live.displayedSharerId && !switchingViewer && <div className="empty-player"><MonitorUp size={30} /><span>选择一名共享者观看</span><small>没有观众的共享不会上传视频</small></div>}
             {switchingViewer && <div className={`view-connecting ${live.connectionStage.phase}`}>
               {live.connectionStage.phase === "failed" ? <WifiOff size={24} /> : <LoaderCircle className="spin" size={24} />}
@@ -1008,6 +1017,24 @@ function RoomView({ session, localHost, networkStarted, networkInvite, onLeave, 
           <div className="player-toolbar">
             <div className="toolbar-tools">
               <button className="icon-button framed" title="全屏观看" aria-label="全屏观看" type="button" onClick={() => void enterFullscreen()} disabled={!live.displayedSharerId}><Maximize2 size={17} /></button>
+              {live.voiceAvailable && (
+                <div className="mic-button-wrapper">
+                  <button
+                    className={`icon-button framed ${live.micEnabled ? "active mic-active" : ""}`}
+                    title={live.micEnabled ? "关闭麦克风" : "开启麦克风"}
+                    aria-label={live.micEnabled ? "关闭麦克风" : "开启麦克风"}
+                    type="button"
+                    onClick={() => void live.toggleMicrophone()}
+                  >
+                    {live.micEnabled ? <Mic size={17} /> : <MicOff size={17} />}
+                  </button>
+                  {live.micEnabled && (
+                    <div className="mic-volume-bar" aria-hidden="true">
+                      <div className="mic-volume-fill" style={{ height: `${Math.max(4, live.micVolume * 100)}%` }} />
+                    </div>
+                  )}
+                </div>
+              )}
               <div className={`toolbar-status ${live.isSharing && !live.hasSystemAudio ? "warning" : ""}`}><Volume2 size={17} /><span>{live.isSharing ? live.hasSystemAudio ? "系统声音正在共享" : "未捕获到系统声音" : "共享时包含系统声音"}</span>{live.isSharing && live.hasSystemAudio && <Check size={16} />}</div>
             </div>
             <div className="toolbar-telemetry">

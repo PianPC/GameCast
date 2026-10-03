@@ -1,6 +1,6 @@
 {
   "name": "@gamecast/desktop",
-  "version": "0.3.7",
+  "version": "0.3.8-voice.3",
   "private": true,
   "license": "GPL-3.0-only",
   "type": "module",
@@ -45,6 +45,10 @@
   "build": {
     "appId": "dev.gamecast.desktop",
     "productName": "GameCast",
+    "publish": {
+      "provider": "generic",
+      "url": "http://localhost"
+    },
     "protocols": [
       {
         "name": "GameCast 房间邀请",

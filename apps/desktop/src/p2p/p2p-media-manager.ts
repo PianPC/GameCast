@@ -69,6 +69,15 @@ export type P2PMediaCallbacks = {
   onStats: (stats: MediaStats | undefined) => void;
   onPublisherStats: (stats: MediaStats | undefined) => void;
   onConnectionStage: (stage: MediaConnectionStage) => void;
+  // 麦克风语音回调
+  onMicStateChanged: (enabled: boolean) => void;
+  onMicVolumeChanged: (volume: number) => void;
+  onRemoteMicStateChanged: (participantId: string, speaking: boolean) => void;
+  onVoiceConnected: () => void;
+  onVoiceDisconnected: () => void;
+  // P2P 语音回调
+  onP2PRemoteMicAdded?: (participantId: string, track: MediaStreamTrack) => void;
+  onP2PRemoteMicRemoved?: (participantId: string) => void;
 };
 
 type OutgoingConnection = {
@@ -140,6 +149,19 @@ export class P2PMediaManager {
   private statsSampling = false;
   private connectionRetryTimer: ReturnType<typeof setTimeout> | undefined;
 
+  // 麦克风语音
+  private micEnabled = false;
+  private micTrack: MediaStreamTrack | undefined;
+  private micStream: MediaStream | undefined;
+  private remoteMicSpeakers = new Set<string>();
+  private micAudioContext: AudioContext | undefined;
+  private micAnalyser: AnalyserNode | undefined;
+  private micVolumeTimer: number | undefined;
+  // 语音模式：p2p（2人，走P2P连接）/ sfu（3人+，走SFU）
+  private voiceMode: "p2p" | "sfu" | "none" = "none";
+  // P2P 远程麦克风音轨集合 (participantId -> track)
+  private p2pRemoteMicTracks = new Map<string, MediaStreamTrack>();
+
   constructor(
     private readonly selfParticipantId: string,
     private readonly p2pSession: P2PSession,
@@ -158,6 +180,32 @@ export class P2PMediaManager {
       sfuAvailable: sfu.available,
     });
     this.monitorTimer = setInterval(() => void this.sampleMediaStats(), 2_000);
+    // 设置 SFU 语音回调
+    this.sfu.setVoiceCallbacks({
+      onRemoteMicStarted: (participantId) => {
+        this.remoteMicSpeakers.add(participantId);
+        this.callbacks.onRemoteMicStateChanged(participantId, true);
+      },
+      onRemoteMicStopped: (participantId) => {
+        this.remoteMicSpeakers.delete(participantId);
+        this.callbacks.onRemoteMicStateChanged(participantId, false);
+      },
+      onRemoteSpeakingChanged: (participantId, speaking) => {
+        this.callbacks.onRemoteMicStateChanged(participantId, speaking);
+      },
+      onVoiceConnected: () => {
+        this.callbacks.onVoiceConnected();
+      },
+      onVoiceDisconnected: () => {
+        this.callbacks.onVoiceDisconnected();
+      },
+    });
+    // 如果 SFU 可用，提前建立连接（用于接收语音，不需要等用户开麦）
+    if (this.sfu.available) {
+      this.sfu.ensureVoiceConnected().catch((error) => {
+        diagnosticLog("media", "sfu.voice-connect-failed", errorDetails(error), "warn");
+      });
+    }
     this.disposeNativeEvents = window.electronAPI?.onNativeMediaEvent((event) => {
       switch (event.type) {
         case "ice": {
@@ -217,6 +265,296 @@ export class P2PMediaManager {
 
   get stream(): MediaStream | undefined {
     return this.localStream;
+  }
+
+  get microphoneEnabled(): boolean {
+    return this.micEnabled;
+  }
+
+  get sfuAvailable(): boolean {
+    return this.sfu.available;
+  }
+
+  /**
+   * 开启麦克风
+   * @param mode 语音模式：p2p（2人走P2P）/ sfu（3人+走SFU），默认自动选择
+   */
+  async startMicrophone(mode?: "p2p" | "sfu"): Promise<void> {
+    if (this.micEnabled) return;
+    // 选择语音模式
+    const useMode = mode ?? (this.sfu.available ? "sfu" : "p2p");
+    this.voiceMode = useMode;
+    diagnosticLog("media", "mic.start.requested", { mode: useMode });
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      const audioTrack = stream.getAudioTracks()[0];
+      if (!audioTrack) throw new Error("未获取到麦克风音轨");
+      this.micStream = stream;
+      this.micTrack = audioTrack;
+
+      if (useMode === "sfu") {
+        if (!this.sfu.available) {
+          throw new Error("当前服务器未配置 SFU，语音功能不可用");
+        }
+        await this.sfu.publishMicrophone(audioTrack);
+      } else {
+        // P2P 模式：将麦克风音轨加到所有 P2P 连接上
+        await this.addMicToAllP2PConnections();
+      }
+
+      this.micEnabled = true;
+      this.callbacks.onMicStateChanged(true);
+      // 启动音量检测
+      this.startMicVolumeMonitor(stream);
+      diagnosticLog("media", "mic.started", { trackId: audioTrack.id, mode: useMode });
+    } catch (error) {
+      diagnosticLog("media", "mic.start-failed", errorDetails(error), "error");
+      // 清理
+      if (this.micStream) {
+        this.micStream.getTracks().forEach((t) => t.stop());
+        this.micStream = undefined;
+      }
+      this.micTrack = undefined;
+      this.micEnabled = false;
+      this.voiceMode = "none";
+      throw error;
+    }
+  }
+
+  /**
+   * 关闭麦克风
+   */
+  async stopMicrophone(): Promise<void> {
+    if (!this.micEnabled) return;
+    diagnosticLog("media", "mic.stop.requested", { mode: this.voiceMode });
+    try {
+      if (this.voiceMode === "sfu") {
+        await this.sfu.unpublishMicrophone();
+      } else if (this.voiceMode === "p2p") {
+        // P2P 模式：从所有 P2P 连接移除麦克风音轨
+        await this.removeMicFromAllP2PConnections();
+      }
+    } catch (error) {
+      diagnosticLog("media", "mic.unpublish-failed", errorDetails(error), "warn");
+    }
+    if (this.micStream) {
+      this.micStream.getTracks().forEach((t) => t.stop());
+      this.micStream = undefined;
+    }
+    this.micTrack = undefined;
+    this.micEnabled = false;
+    this.voiceMode = "none";
+    // 停止音量检测
+    this.stopMicVolumeMonitor();
+    this.callbacks.onMicStateChanged(false);
+    diagnosticLog("media", "mic.stopped");
+  }
+
+  /**
+   * 启动麦克风音量监测
+   */
+  private startMicVolumeMonitor(stream: MediaStream): void {
+    try {
+      const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      this.micAudioContext = new AudioContextClass();
+      const source = this.micAudioContext.createMediaStreamSource(stream);
+      this.micAnalyser = this.micAudioContext.createAnalyser();
+      this.micAnalyser.fftSize = 256;
+      source.connect(this.micAnalyser);
+
+      const dataArray = new Uint8Array(this.micAnalyser.frequencyBinCount);
+      const sampleVolume = () => {
+        if (!this.micAnalyser) return;
+        this.micAnalyser.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          sum += dataArray[i]!;
+        }
+        const average = sum / dataArray.length;
+        // 归一化到 0-1
+        const volume = Math.min(1, average / 128);
+        this.callbacks.onMicVolumeChanged(volume);
+        this.micVolumeTimer = window.requestAnimationFrame(sampleVolume);
+      };
+      sampleVolume();
+    } catch (error) {
+      diagnosticLog("media", "mic.volume-monitor-failed", errorDetails(error), "warn");
+    }
+  }
+
+  /**
+   * 停止麦克风音量监测
+   */
+  private stopMicVolumeMonitor(): void {
+    if (this.micVolumeTimer) {
+      cancelAnimationFrame(this.micVolumeTimer);
+      this.micVolumeTimer = undefined;
+    }
+    if (this.micAudioContext) {
+      this.micAudioContext.close().catch(() => {});
+      this.micAudioContext = undefined;
+    }
+    this.micAnalyser = undefined;
+    this.callbacks.onMicVolumeChanged(0);
+  }
+
+  // ==================== P2P 语音 ====================
+
+  /**
+   * 将麦克风音轨加到所有 P2P 连接上（出站和入站）
+   * 并触发重新协商
+   */
+  private async addMicToAllP2PConnections(): Promise<void> {
+    if (!this.micTrack || !this.micStream) return;
+    const micTrack = this.micTrack;
+    const micStream = this.micStream;
+
+    diagnosticLog("media", "mic.p2p.adding-to-all", {
+      outgoingCount: this.outgoing.size,
+      incomingCount: this.incoming.size,
+    });
+
+    // 出站连接：加麦克风音轨并重新协商
+    for (const [connectionId, record] of this.outgoing) {
+      try {
+        record.pc.addTrack(micTrack, micStream);
+        diagnosticLog("media", "mic.p2p.added-outgoing", { connectionId });
+        await this.renegotiateOutgoing(connectionId);
+      } catch (error) {
+        diagnosticLog("media", "mic.p2p.add-outgoing-failed", {
+          connectionId,
+          error: errorDetails(error),
+        }, "warn");
+      }
+    }
+
+    // 入站连接：加麦克风音轨并重新协商（观众→发布者反向语音）
+    for (const [connectionId, record] of this.incoming) {
+      try {
+        record.pc.addTrack(micTrack, micStream);
+        diagnosticLog("media", "mic.p2p.added-incoming", { connectionId });
+        await this.renegotiateIncoming(connectionId);
+      } catch (error) {
+        diagnosticLog("media", "mic.p2p.add-incoming-failed", {
+          connectionId,
+          error: errorDetails(error),
+        }, "warn");
+      }
+    }
+  }
+
+  /**
+   * 从所有 P2P 连接移除麦克风音轨
+   */
+  private async removeMicFromAllP2PConnections(): Promise<void> {
+    if (!this.micTrack) return;
+    const micTrack = this.micTrack;
+
+    diagnosticLog("media", "mic.p2p.removing-from-all", {
+      outgoingCount: this.outgoing.size,
+      incomingCount: this.incoming.size,
+    });
+
+    // 出站连接
+    for (const [connectionId, record] of this.outgoing) {
+      try {
+        const sender = record.pc.getSenders().find((s) => s.track === micTrack);
+        if (sender) {
+          record.pc.removeTrack(sender);
+          diagnosticLog("media", "mic.p2p.removed-outgoing", { connectionId });
+          await this.renegotiateOutgoing(connectionId);
+        }
+      } catch (error) {
+        diagnosticLog("media", "mic.p2p.remove-outgoing-failed", {
+          connectionId,
+          error: errorDetails(error),
+        }, "warn");
+      }
+    }
+
+    // 入站连接
+    for (const [connectionId, record] of this.incoming) {
+      try {
+        const sender = record.pc.getSenders().find((s) => s.track === micTrack);
+        if (sender) {
+          record.pc.removeTrack(sender);
+          diagnosticLog("media", "mic.p2p.removed-incoming", { connectionId });
+          await this.renegotiateIncoming(connectionId);
+        }
+      } catch (error) {
+        diagnosticLog("media", "mic.p2p.remove-incoming-failed", {
+          connectionId,
+          error: errorDetails(error),
+        }, "warn");
+      }
+    }
+  }
+
+  /**
+   * 出站连接重新协商（发布者侧触发）
+   */
+  private async renegotiateOutgoing(connectionId: string): Promise<void> {
+    const record = this.outgoing.get(connectionId);
+    if (!record) return;
+    const pc = record.pc;
+    const viewerId = record.viewerId;
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    diagnosticLog("publisher", "renegotiate.offer.created", { connectionId });
+    await this.flushCandidates(connectionId, pc);
+    this.signaling.send({
+      type: "rtc.offer",
+      connectionId,
+      targetParticipantId: viewerId,
+      description: { type: "offer", sdp: offer.sdp ?? "" },
+    });
+  }
+
+  /**
+   * 入站连接重新协商（观看者侧触发）
+   */
+  private async renegotiateIncoming(connectionId: string): Promise<void> {
+    const record = this.incoming.get(connectionId);
+    if (!record) return;
+    const pc = record.pc;
+    const participantId = record.targetParticipantId;
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    diagnosticLog("viewer", "renegotiate.offer.created", { connectionId });
+    await this.flushCandidates(connectionId, pc);
+    this.signaling.send({
+      type: "rtc.offer",
+      connectionId,
+      targetParticipantId: participantId,
+      description: { type: "offer", sdp: offer.sdp ?? "" },
+    });
+  }
+
+  /**
+   * 获取 P2P 模式下所有远程麦克风音轨（用于播放）
+   */
+  getP2PRemoteMicTracks(): Map<string, MediaStreamTrack> {
+    return this.p2pRemoteMicTracks;
+  }
+
+  /**
+   * 获取远程语音混合流
+   */
+  getRemoteVoiceStream(): MediaStream {
+    return this.sfu.getVoiceStream();
+  }
+
+  /**
+   * 检查远程参与者是否在说话（开了麦克风）
+   */
+  isRemoteSpeaking(participantId: string): boolean {
+    return this.remoteMicSpeakers.has(participantId);
   }
 
   startSharing(sourceId: string, preset: VideoPreset): Promise<void> {
@@ -806,6 +1144,7 @@ export class P2PMediaManager {
     this.releaseRemoteWatches();
     this.pendingCandidates.clear();
     await this.stopSharing(false);
+    await this.stopMicrophone().catch(() => undefined);
     await this.sfu.disconnect();
   }
 
@@ -891,6 +1230,11 @@ export class P2PMediaManager {
         this.preferH264(pc, sender);
       }
     }
+    // P2P 语音：如果麦克风已开启且是 P2P 模式，加上麦克风音轨
+    if (this.micEnabled && this.voiceMode === "p2p" && this.micTrack && this.micStream) {
+      pc.addTrack(this.micTrack, this.micStream);
+      diagnosticLog("media", "mic.p2p.added-on-create-outgoing", { connectionId });
+    }
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     diagnosticLog("publisher", "browser.offer.created", {
@@ -944,6 +1288,11 @@ export class P2PMediaManager {
     this.configureIncoming(record);
     await record.pc.setRemoteDescription(description);
     await this.flushCandidates(connectionId, record.pc);
+    // P2P 语音：如果麦克风已开启且是 P2P 模式，加上麦克风音轨（观众→发布者反向语音）
+    if (this.micEnabled && this.voiceMode === "p2p" && this.micTrack && this.micStream) {
+      record.pc.addTrack(this.micTrack, this.micStream);
+      diagnosticLog("media", "mic.p2p.added-on-handle-offer", { connectionId });
+    }
     const answer = await record.pc.createAnswer();
     await record.pc.setLocalDescription(answer);
     diagnosticLog("viewer", "answer.created", {
@@ -987,6 +1336,34 @@ export class P2PMediaManager {
         readyState: event.track.readyState,
         streamCount: event.streams.length,
       });
+      const remoteStream = event.streams[0];
+      const isMicTrack = event.track.kind === "audio" && remoteStream && remoteStream.getVideoTracks().length === 0;
+
+      // P2P 语音：如果是麦克风音轨（纯音频流，没有视频），单独处理
+      if (isMicTrack) {
+        diagnosticLog("media", "mic.p2p.remote-mic-received", {
+          connectionId: record.connectionId,
+          participantId: record.targetParticipantId,
+          trackId: event.track.id,
+        });
+        this.p2pRemoteMicTracks.set(record.targetParticipantId, event.track);
+        this.remoteMicSpeakers.add(record.targetParticipantId);
+        this.callbacks.onRemoteMicStateChanged(record.targetParticipantId, true);
+        // 监听音轨结束
+        event.track.addEventListener("ended", () => {
+          if (this.p2pRemoteMicTracks.get(record.targetParticipantId) === event.track) {
+            this.p2pRemoteMicTracks.delete(record.targetParticipantId);
+            this.remoteMicSpeakers.delete(record.targetParticipantId);
+            this.callbacks.onRemoteMicStateChanged(record.targetParticipantId, false);
+            diagnosticLog("media", "mic.p2p.remote-mic-ended", {
+              participantId: record.targetParticipantId,
+            });
+          }
+        });
+        this.callbacks.onP2PRemoteMicAdded?.(record.targetParticipantId, event.track);
+        return;
+      }
+
       const tracks = event.streams[0]?.getTracks() ?? [event.track];
       for (const track of tracks) {
         if (!record.stream.getTracks().some((candidate) => candidate.id === track.id)) {

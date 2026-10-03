@@ -212,6 +212,11 @@ input::placeholder { color: var(--placeholder); }
 .icon-button { width: 34px; height: 34px; flex: 0 0 auto; padding: 0; color: var(--muted); border: 1px solid transparent; background: transparent; }
 .icon-button:hover { color: var(--text); border-color: var(--line); background: var(--surface-hover); }
 .icon-button.framed { border-color: var(--line); background: var(--surface-raised); }
+.icon-button.framed.mic-active { border-color: var(--primary); color: var(--primary); background: var(--primary-soft); }
+.icon-button.framed.mic-active svg { color: var(--primary); }
+.mic-button-wrapper { position: relative; display: inline-flex; align-items: center; }
+.mic-volume-bar { position: absolute; right: -4px; top: 50%; transform: translateY(-50%); width: 4px; height: 24px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.mic-volume-fill { position: absolute; bottom: 0; left: 0; right: 0; background: var(--primary); border-radius: 2px; transition: height 0.05s ease-out; }
 .theme-menu { position: relative; height: 34px; }
 .theme-menu > summary { display: inline-flex; list-style: none; }
 .theme-menu > summary::-webkit-details-marker { display: none; }
@@ -318,6 +323,11 @@ input::placeholder { color: var(--placeholder); }
 .member-row strong { overflow: hidden; color: var(--text-soft); font-size: 12px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
 .member-row small { color: var(--muted-dim); font-size: 10px; }
 .member-dot { width: 6px; height: 6px; box-shadow: none; }
+.member-dot.speaking { background: var(--primary); box-shadow: 0 0 0 3px var(--primary-glow); animation: pulse-glow 1.5s ease-in-out infinite; }
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 0 3px var(--primary-glow); }
+  50% { box-shadow: 0 0 0 5px var(--primary-glow); }
+}
 .people-footer { min-height: 48px; justify-content: space-between; padding: 0 8px 0 14px; border-top: 1px solid var(--line); color: var(--muted-dim); font-size: 10px; }
 .people-footer > span { display: flex; align-items: center; gap: 6px; }
 .people-footer svg { color: var(--muted); }
